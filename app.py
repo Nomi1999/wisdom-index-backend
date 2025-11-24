@@ -99,7 +99,9 @@ jwt = JWTManager(app)
 # Configure CORS for specific origins in production
 if os.getenv('ENVIRONMENT') == 'production':
     # In production, allow your Vercel frontend domain
-    frontend_url = os.getenv('FRONTEND_URL', 'https://wisdom-index-frontend.vercel.app/')
+    frontend_url = os.getenv('FRONTEND_URL', 'https://wisdom-index-frontend.vercel.app')
+    # Remove trailing slash if present
+    frontend_url = frontend_url.rstrip('/') if frontend_url else frontend_url
     CORS(app, origins=[frontend_url, 'https://vercel.com'])
 else:
     # In development, allow localhost
