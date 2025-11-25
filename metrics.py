@@ -5708,8 +5708,8 @@ def _get_accounts_for_client(client_id):
         )
         SELECT
             ai.account_id,
-            COALESCE(f.fact_type_name, ai.account_id) || ' (' || ai.account_id || ')' as account_name,
-            COALESCE(f.sub_type, 'Investment Account') as account_type,
+            COALESCE(f.sub_type, 'Investment Account') || ' (' || ai.account_id || ')' as account_name,
+            COALESCE(f.fact_type_name, 'Account Type') as account_type,
             COALESCE(av.current_value, 0) as current_value,
             TO_CHAR(ai.first_date, 'YYYY-MM-DD') as start_date,
             TO_CHAR(ai.last_date, 'YYYY-MM-DD') as end_date,
