@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, current_app
+from flask import Flask, jsonify, request, current_app, Response, stream_with_context
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager, jwt_required, create_access_token, get_jwt_identity
 from auth import login_user, register_user, register_admin_user, admin_required, superuser_required, get_admin_security_code, update_admin_security_code
@@ -76,7 +76,7 @@ from metrics import (
 
 # Import client name function
 from metrics import get_client_name_for_user, get_client_name_by_id
-from insights import get_all_user_metrics, generate_ai_insights, generate_financial_summary
+from insights import get_all_user_metrics, generate_ai_insights, generate_financial_summary, generate_ai_insights_stream
 import os
 import json
 from datetime import datetime
@@ -2023,11 +2023,12 @@ def generate_insights():
                 "assets_and_liabilities": { ... },
                 "income_analysis": { ... },
                 ...
-            }
+            },
+            "stream": true            // Optional: Stream the response
         }
         
     Returns:
-        JSON response with AI-generated insights or error message
+        JSON response with AI-generated insights or error message, or a streamed response
     """
     try:
         # Get the user ID from the JWT token
@@ -2039,10 +2040,16 @@ def generate_insights():
         except Exception:
             data = {}
         
+        print(f"DEBUG: /api/insights/generate received data keys: {list(data.keys())}")
+        
         include_summary = data.get('include_summary', False)
         metrics_data_from_frontend = data.get('metrics_data')
         
-        print(f"DEBUG: Generating insights for user {user_id}")
+        # Handle stream flag flexibly (boolean or string)
+        stream_val = data.get('stream', False)
+        stream_response = str(stream_val).lower() == 'true' if isinstance(stream_val, str) else bool(stream_val)
+        
+        print(f"DEBUG: Generating insights for user {user_id}, stream={stream_response}")
         
         # Use metrics from frontend if provided, otherwise fetch from database
         if metrics_data_from_frontend:
@@ -2054,8 +2061,20 @@ def generate_insights():
             print(f"DEBUG: Fetching metrics from database (fallback)")
             # Get all user metrics for AI analysis (original behavior)
             metrics_data = get_all_user_metrics()
+            
+        if stream_response:
+            def generate():
+                # Generator for streaming response
+                for chunk in generate_ai_insights_stream(metrics_data):
+                    yield chunk
+            
+            return Response(
+                stream_with_context(generate()), 
+                mimetype='text/plain; charset=utf-8',
+                headers={"X-Accel-Buffering": "no"}
+            )
         
-        # Generate AI insights
+        # Generate AI insights (non-streaming)
         insights = generate_ai_insights(metrics_data)
         
         # Prepare response data
@@ -2119,8 +2138,11 @@ def generate_insights_for_client_admin(client_id):
             data = {}
         
         include_summary = data.get('include_summary', False)
+        # Handle stream flag flexibly
+        stream_val = data.get('stream', False)
+        stream_response = str(stream_val).lower() == 'true' if isinstance(stream_val, str) else bool(stream_val)
         
-        print(f"DEBUG: Admin {admin_user_id} generating insights for client {client_id}")
+        print(f"DEBUG: Admin {admin_user_id} generating insights for client {client_id}, stream={stream_response}")
         
         # Get all metrics for the specified client
         from metrics import get_all_metrics_for_client
@@ -2134,6 +2156,18 @@ def generate_insights_for_client_admin(client_id):
         
         # Add client_id to metrics data for consistency
         metrics_data['client_id'] = client_id
+        
+        if stream_response:
+            def generate():
+                # Generator for streaming response
+                for chunk in generate_ai_insights_stream(metrics_data):
+                    yield chunk
+            
+            return Response(
+                stream_with_context(generate()), 
+                mimetype='text/plain; charset=utf-8',
+                headers={"X-Accel-Buffering": "no"}
+            )
         
         # Generate AI insights using the same function as client-side
         insights = generate_ai_insights(metrics_data)

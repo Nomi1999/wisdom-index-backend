@@ -321,6 +321,114 @@ def generate_ai_insights(metrics_data):
         else:
             return "We're unable to generate personalized insights at this moment. Please try again later or contact your financial advisor for a comprehensive review."
 
+
+def generate_ai_insights_stream(metrics_data):
+    """
+    Generate AI insights based on financial metrics using OpenAI-compatible API with streaming.
+    
+    Args:
+        metrics_data (dict): Dictionary containing all financial metrics
+        
+    Yields:
+        str: Chunks of AI-generated insights text
+    """
+    try:
+        import httpx
+        
+        ai_config = get_ai_configuration()
+        base_url = ai_config['base_url']
+        api_key = ai_config['api_key']
+        model = ai_config['model']
+        
+        # Create a custom HTTP client without proxy settings
+        http_client = httpx.Client()
+        
+        client = openai.OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            http_client=http_client
+        )
+        
+        # Prepare the prompt for AI analysis
+        prompt = f"""
+        You are a professional financial advisor analyzing a client's comprehensive financial metrics.
+        Please analyze the following financial data and provide personalized, actionable insights.
+
+        Financial Data:
+        {json.dumps(metrics_data, indent=2)}
+
+        Please provide insights in the following exact format with these 5 sections:
+
+        Overall Financial Health Assessment:
+        [Provide 2-3 sentences about the client's overall financial health]
+
+        Strengths in Your Financial Situation:
+        - [First strength in bullet point]
+        - [Second strength in bullet point]
+        - [Third strength in bullet point]
+
+        Areas Needing Improvement:
+        - [First area needing improvement in bullet point]
+        - [Second area needing improvement in bullet point]
+        - [Third area needing improvement in bullet point]
+
+        Specific Recommendations for Optimization:
+        - [First specific recommendation in bullet point]
+        - [Second specific recommendation in bullet point]
+        - [Third specific recommendation in bullet point]
+
+        Risk Considerations and Mitigation Strategies:
+        - [First risk consideration in bullet point]
+        - [Second risk consideration in bullet point]
+        - [Third risk consideration in bullet point]
+
+        Important formatting rules:
+        - Use exactly these section headers followed by a colon
+        - Use bullet points (starting with -) for all items under the sections
+        - Do not use any markdown formatting like **bold**, *italic*, or # headers
+        - Keep language clear, professional, and actionable
+        - Focus on practical advice the client can implement
+        """
+        
+        # Yield a single space to trigger headers immediately
+        yield " "
+        
+        # Make the API call with streaming
+        model_to_use = model
+        
+        print(f"DEBUG: Starting OpenAI stream with model {model_to_use}")
+        
+        stream = client.chat.completions.create(
+            model=model_to_use,
+            messages=[
+                {"role": "system", "content": "You are a professional financial advisor providing personalized insights based on comprehensive financial data. Format your response as clean, readable text without any markdown symbols or formatting characters."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=800,
+            temperature=0.7,
+            stream=True
+        )
+        
+        # Stream the response
+        import time
+        for chunk in stream:
+            if chunk.choices[0].delta.content is not None:
+                content = chunk.choices[0].delta.content
+                # print(f"DEBUG: Yielding chunk: {content[:10]}...") # Optional: uncomment for verbose logging
+                yield content
+                # Tiny sleep to ensure smooth streaming to client if backend is too fast
+                time.sleep(0.01)
+                
+    except Exception as e:
+        error_msg = f"Error generating AI insights stream: {e}"
+        try:
+            current_app.logger.error(error_msg)
+        except RuntimeError:
+            print(error_msg)
+        
+        # Yield error message
+        yield f"Error: {str(e)}"
+
 def clean_markdown_formatting(text):
     """
     Remove markdown formatting characters from text while preserving bullet points.
