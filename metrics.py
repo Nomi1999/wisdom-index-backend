@@ -3901,15 +3901,140 @@ def get_all_metrics_for_client(client_id):
             FROM core.disability_ltc_insurance_accounts
             WHERE client_id = %s AND fact_type_name ~* 'disability'
         ),
-        taxable_accounts AS (
-            SELECT SUM(total_value) AS taxable_balance
-            FROM core.investment_deposit_accounts
-            WHERE client_id = %s
-                AND (sub_type ~* 'taxable' OR account_name ~* 'taxable|brokerage')
-        )
-        
-        -- FINAL SELECT: Calculate all metrics in one query
-        SELECT
+         taxable_accounts AS (
+             SELECT SUM(total_value) AS taxable_balance
+             FROM core.investment_deposit_accounts
+             WHERE client_id = %s
+                 AND (sub_type ~* 'taxable' OR account_name ~* 'taxable|brokerage')
+         ),
+         
+         -- WISDOM INDEX RATIOS CTEs
+         savings_ratio_calc AS (
+             SELECT
+                 ROUND(COALESCE(savings.current_year_savings, 0) / NULLIF(income.total_income, 0), 2) as savings_ratio
+             FROM (
+                 SELECT
+                     COALESCE(SUM(calculated_annual_amount_usd), 0) as current_year_savings
+                 FROM core.savings
+                 WHERE start_type = 'Active'
+                   AND client_id = %s
+             ) savings
+             CROSS JOIN (
+                 SELECT
+                     COALESCE(SUM(current_year_amount), 0) as total_income
+                 FROM core.incomes
+                 WHERE client_id = %s
+                   AND current_year_amount IS NOT NULL
+             ) income
+         ),
+         giving_ratio_calc AS (
+             SELECT
+                 ROUND(COALESCE(giving.current_year_giving, 0) / NULLIF(income.total_income, 0), 2) as giving_ratio
+             FROM (
+                 SELECT
+                     COALESCE(SUM(annual_amount), 0) AS current_year_giving
+                 FROM core.expenses
+                 WHERE client_id = %s
+                     AND type = 'Spending'
+                     AND sub_type = 'GivingAndPhilanthropy'
+                     AND annual_amount > 0
+                     -- Check if expense overlaps with current year
+                     AND EXTRACT(YEAR FROM start_actual_date) <= EXTRACT(YEAR FROM CURRENT_DATE)
+                     AND (end_actual_date IS NULL OR EXTRACT(YEAR FROM end_actual_date) >= EXTRACT(YEAR FROM CURRENT_DATE))
+             ) giving
+             CROSS JOIN (
+                 SELECT
+                     COALESCE(SUM(current_year_amount), 0) as total_income
+                 FROM core.incomes
+                 WHERE client_id = %s
+                   AND current_year_amount IS NOT NULL
+             ) income
+         ),
+         reserves_ratio_calc AS (
+             SELECT
+                 ROUND((COALESCE(cash.total_cash, 0) / NULLIF(expenses.current_year_living_expenses, 0)) * 0.5, 2) as reserves
+             FROM (
+                 WITH holdings_cash AS (
+                     SELECT
+                         client_id,
+                         SUM(CASE WHEN asset_class = 'cash' THEN value ELSE 0 END) as cash_from_holdings
+                     FROM core.holdings
+                     WHERE asset_class = 'cash' AND value IS NOT NULL
+                     AND client_id = %s
+                     GROUP BY client_id
+                 ),
+                 investment_cash AS (
+                     SELECT
+                         client_id,
+                         SUM(COALESCE(cash_balance, 0)) as cash_from_investments
+                     FROM core.investment_deposit_accounts
+                     WHERE fact_type_name = 'Cash Alternative'
+                         AND cash_balance IS NOT NULL
+                         AND client_id = %s
+                     GROUP BY client_id
+                 )
+         
+                 SELECT
+                     COALESCE(h.cash_from_holdings, 0) + COALESCE(i.cash_from_investments, 0) as total_cash
+                 FROM holdings_cash h
+                 FULL OUTER JOIN investment_cash i ON h.client_id = i.client_id
+             ) cash
+             CROSS JOIN (
+                 SELECT
+                     COALESCE(SUM(annual_amount), 0) AS current_year_living_expenses
+                 FROM core.expenses
+                 WHERE client_id = %s
+                     AND type = 'Living'
+                     AND annual_amount > 0
+                     -- Check if expense overlaps with current year
+                     AND EXTRACT(YEAR FROM start_actual_date) <= EXTRACT(YEAR FROM CURRENT_DATE)
+                     AND (end_actual_date IS NULL OR EXTRACT(YEAR FROM end_actual_date) >= EXTRACT(YEAR FROM CURRENT_DATE))
+                     -- Ensure logical date ranges
+                     AND (end_actual_date IS NULL OR end_actual_date >= start_actual_date)
+             ) expenses
+         ),
+         debt_ratio_calc AS (
+             SELECT
+                 ROUND(house_equity / NULLIF(house_value, 0), 2) as debt
+             FROM (
+                 SELECT
+                     COALESCE(SUM(rea.total_value), 0) as house_value,
+                     COALESCE(SUM(rea.total_value), 0) - COALESCE(SUM(CASE WHEN lna.sub_type = 'Mortgage' THEN ABS(lna.total_value) ELSE 0 END), 0) as house_equity
+                 FROM core.real_estate_assets rea
+                 LEFT JOIN core.liability_note_accounts lna ON rea.account_id = lna.real_estate_id
+                 WHERE rea.sub_type = 'Residence'
+                   AND rea.client_id = %s
+                   AND (lna.sub_type = 'Mortgage' OR lna.sub_type IS NULL)
+                 GROUP BY rea.client_id
+             ) house_data
+         ),
+         diversification_ratio_calc AS (
+             SELECT
+                 ROUND(1 - (largest_holding / NULLIF(total_portfolio, 0)), 2) as diversification
+             FROM (
+                 SELECT
+                     (SELECT MAX(value)
+                      FROM core.holdings
+                      WHERE client_id = %s
+                        AND value IS NOT NULL
+                        AND value > 0) as largest_holding,
+                     (SELECT SUM(portfolio_value)
+                      FROM (
+                          SELECT COALESCE(SUM(value), 0) AS portfolio_value
+                          FROM core.holdings
+                          WHERE client_id = %s
+                          
+                          UNION ALL
+                          
+                          SELECT COALESCE(SUM(total_value), 0)
+                          FROM core.investment_deposit_accounts
+                          WHERE client_id = %s
+                      ) portfolio_components) as total_portfolio
+             ) calculations
+         )
+         
+         -- FINAL SELECT: Calculate all metrics in one query
+         SELECT
             -- Assets & Liabilities
             COALESCE(h.total_holdings, 0) + COALESCE(rea.total_real_estate, 0) + COALESCE(b.total_businesses, 0) +
             COALESCE(ia.total_investments, 0) + COALESCE(pp.total_personal_property, 0) - COALESCE(l.total_liabilities, 0) AS net_worth,
@@ -3966,12 +4091,19 @@ def get_all_metrics_for_client(client_id):
             ROUND((COALESCE(ta.taxable_balance, 0) + COALESCE(tspv.taxable_savings, 0)) /
                   NULLIF(COALESCE(cepv.car_expenses, 0), 0), 2) AS new_cars_ratio,
             
-            ROUND((COALESCE(lfi.pv_future_income, 0) + COALESCE(ra.current_assets, 0)) /
-                  NULLIF(COALESCE(frepv.regular_expenses, 0) + COALESCE(ltcepv.ltc_expenses, 0), 0), 2) AS ltc_ratio,
-            
-            ROUND(COALESCE(ltdv.ltd_benefit, 0) / NULLIF(COALESCE(ib.earned_income, 0), 0), 2) AS ltd_ratio
-            
-        FROM client_info ci
+             ROUND((COALESCE(lfi.pv_future_income, 0) + COALESCE(ra.current_assets, 0)) /
+                   NULLIF(COALESCE(frepv.regular_expenses, 0) + COALESCE(ltcepv.ltc_expenses, 0), 0), 2) AS ltc_ratio,
+             
+             ROUND(COALESCE(ltdv.ltd_benefit, 0) / NULLIF(COALESCE(ib.earned_income, 0), 0), 2) AS ltd_ratio,
+             
+             -- Wisdom Index Ratios
+             COALESCE(src.savings_ratio, 0) AS savings_ratio,
+             COALESCE(grc.giving_ratio, 0) AS giving_ratio,
+             COALESCE(rrc.reserves, 0) AS reserves_ratio,
+             COALESCE(drc.debt, 0) AS debt_ratio,
+             COALESCE(dirc.diversification, 0) AS diversification_ratio
+             
+         FROM client_info ci
         LEFT JOIN holdings_agg h ON true
         LEFT JOIN investment_accounts_agg ia ON true
         LEFT JOIN real_estate_agg rea ON true
@@ -4002,9 +4134,14 @@ def get_all_metrics_for_client(client_id):
         LEFT JOIN taxable_accounts ta ON true
         LEFT JOIN taxable_savings_pv tspv ON true
         LEFT JOIN car_expenses_pv cepv ON true
-        LEFT JOIN ltc_expenses_pv ltcepv ON true
-        LEFT JOIN future_regular_expenses_pv frepv ON true
-        LEFT JOIN ltd_value ltdv ON true;
+         LEFT JOIN ltc_expenses_pv ltcepv ON true
+         LEFT JOIN future_regular_expenses_pv frepv ON true
+         LEFT JOIN ltd_value ltdv ON true
+         LEFT JOIN savings_ratio_calc src ON true
+         LEFT JOIN giving_ratio_calc grc ON true
+         LEFT JOIN reserves_ratio_calc rrc ON true
+         LEFT JOIN debt_ratio_calc drc ON true
+         LEFT JOIN diversification_ratio_calc dirc ON true;
         """
         
         # Count %s placeholders and provide matching number of client_id parameters
@@ -4064,13 +4201,13 @@ def get_all_metrics_for_client(client_id):
                 'ltc_ratio': float(result[31]) if result[31] is not None else None,
                 'ltd_ratio': float(result[32]) if result[32] is not None else None
             },
-            'wisdom_index_ratios': {
-                'savings_ratio': calculate_savings_ratio_for_client(client_id),
-                'giving_ratio': calculate_giving_ratio_for_client(client_id),
-                'reserves_ratio': calculate_reserves_ratio_for_client(client_id),
-                'debt_ratio': calculate_debt_ratio_for_client(client_id),
-                'diversification_ratio': calculate_diversification_ratio_for_client(client_id)
-            }
+             'wisdom_index_ratios': {
+                 'savings_ratio': float(result[33]) if result[33] is not None else 0,
+                 'giving_ratio': float(result[34]) if result[34] is not None else 0,
+                 'reserves_ratio': float(result[35]) if result[35] is not None else 0,
+                 'debt_ratio': float(result[36]) if result[36] is not None else 0,
+                 'diversification_ratio': float(result[37]) if result[37] is not None else 0
+             }
         }
         
     except Exception as e:
@@ -4097,9 +4234,9 @@ def get_all_metrics_for_client(client_id):
                 'retirement_ratio': None, 'survivor_ratio': None, 'education_ratio': None,
                 'new_cars_ratio': None, 'ltc_ratio': None, 'ltd_ratio': None
             },
-            'wisdom_index_ratios': {
-                'savings_ratio': None, 'giving_ratio': None, 'reserves_ratio': None, 'debt_ratio': None, 'diversification_ratio': None
-            }
+             'wisdom_index_ratios': {
+                 'savings_ratio': 0, 'giving_ratio': 0, 'reserves_ratio': 0, 'debt_ratio': 0, 'diversification_ratio': 0
+             }
         }
     finally:
         if connection:
