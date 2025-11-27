@@ -1,5 +1,14 @@
+# Monkey patch must be the very first thing
+import gevent.monkey
+gevent.monkey.patch_all()
+
+# NOTE: If using OpenAI with gevent, ensure openai >= 1.55.3 to avoid "Client.__init__() got an unexpected keyword argument 'proxies'"
+# This error happens because older openai versions + gevent interfere with httpx's proxy handling during thread patching.
+
+import traceback
 from flask import Flask, jsonify, request, current_app, Response, stream_with_context
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit, join_room
 from flask_jwt_extended import JWTManager, jwt_required, create_access_token, get_jwt_identity
 from auth import login_user, register_user, register_admin_user, admin_required, superuser_required, get_admin_security_code, update_admin_security_code
 from metrics import (
@@ -88,6 +97,9 @@ load_dotenv()
 # Initialize Flask application
 app = Flask(__name__)
 
+# Initialize SocketIO
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
+
 # Configure JWT
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your-super-secret-jwt-key-change-this-in-production')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = 3600  # 1 hour
@@ -106,6 +118,17 @@ if os.getenv('ENVIRONMENT') == 'production':
 else:
     # In development, allow localhost
     CORS(app, origins=['http://localhost:3000', 'http://127.0.0.1:3000'])
+
+@socketio.on('join')
+def on_join(data):
+    """
+    Handle client joining a specific room for real-time updates.
+    """
+    client_id = data.get('client_id')
+    if client_id:
+        room = f'client_{client_id}'
+        join_room(room)
+        print(f"Client {client_id} joined room {room}")
 
 @app.route('/auth/login', methods=['POST'])
 def login():
@@ -2309,10 +2332,16 @@ def update_all_targets():
         success = update_multiple_targets_for_user(targets_dict)
         
         if success:
-            user_id = get_jwt_identity()
+            client_id = get_jwt_identity()
+            # For regular users, the JWT identity IS the client_id
+            try:
+                socketio.emit('targets_updated', {'source': 'user', 'action': 'update_all'}, room=f'client_{client_id}')
+            except Exception as e:
+                print(f"Error emitting socket event: {e}")
+
             return jsonify({
                 "message": "Targets updated successfully",
-                "user_id": user_id
+                "user_id": client_id
             })
         else:
             return jsonify({"error": "Failed to update targets"}), 500
@@ -2366,10 +2395,15 @@ def update_single_target(metric_name):
         success = update_metric_target_for_user(metric_name, target_value)
         
         if success:
-            user_id = get_jwt_identity()
+            client_id = get_jwt_identity()
+            try:
+                socketio.emit('targets_updated', {'source': 'user', 'action': 'update_single', 'metric': metric_name}, room=f'client_{client_id}')
+            except Exception as e:
+                print(f"Error emitting socket event: {e}")
+
             return jsonify({
                 "message": f"Target for {metric_name} updated successfully",
-                "user_id": user_id
+                "user_id": client_id
             })
         else:
             return jsonify({"error": "Failed to update target"}), 500
@@ -2411,10 +2445,15 @@ def delete_single_target(metric_name):
         success = delete_metric_target_for_user(db_metric_name)
         
         if success:
-            user_id = get_jwt_identity()
+            client_id = get_jwt_identity()
+            try:
+                socketio.emit('targets_updated', {'source': 'user', 'action': 'delete_single', 'metric': db_metric_name}, room=f'client_{client_id}')
+            except Exception as e:
+                print(f"Error emitting socket event: {e}")
+
             return jsonify({
                 "message": f"Target for {db_metric_name} deleted successfully",
-                "user_id": user_id
+                "user_id": client_id
             })
         else:
             return jsonify({"error": "Target not found or failed to delete"}), 404
@@ -2436,10 +2475,15 @@ def delete_all_targets():
         success = delete_all_targets_for_user()
         
         if success:
-            user_id = get_jwt_identity()
+            client_id = get_jwt_identity()
+            try:
+                socketio.emit('targets_updated', {'source': 'user', 'action': 'delete_all'}, room=f'client_{client_id}')
+            except Exception as e:
+                print(f"Error emitting socket event: {e}")
+
             return jsonify({
                 "message": "All targets deleted successfully",
-                "user_id": user_id
+                "user_id": client_id
             })
         else:
             return jsonify({"error": "Failed to delete targets"}), 500
@@ -3075,6 +3119,11 @@ def update_client_targets_admin(client_id):
         success = update_targets_for_client(client_id, targets_dict)
         
         if success:
+            try:
+                socketio.emit('targets_updated', {'source': 'admin', 'action': 'update_all'}, room=f'client_{client_id}')
+            except Exception as e:
+                print(f"Error emitting socket event: {e}")
+
             return jsonify({
                 "message": f"Targets updated successfully for client {client_id}",
                 "client_id": client_id
@@ -3109,6 +3158,11 @@ def delete_client_target_admin(client_id, metric_name):
         success = delete_target_for_client(client_id, db_metric_name)
         
         if success:
+            try:
+                socketio.emit('targets_updated', {'source': 'admin', 'action': 'delete_single', 'metric': db_metric_name}, room=f'client_{client_id}')
+            except Exception as e:
+                print(f"Error emitting socket event: {e}")
+
             return jsonify({
                 "message": f"Target for {db_metric_name} deleted successfully",
                 "client_id": client_id
@@ -3139,6 +3193,11 @@ def delete_all_client_targets_admin(client_id):
         success = delete_all_targets_for_client(client_id)
         
         if success:
+            try:
+                socketio.emit('targets_updated', {'source': 'admin', 'action': 'delete_all'}, room=f'client_{client_id}')
+            except Exception as e:
+                print(f"Error emitting socket event: {e}")
+
             return jsonify({
                 "message": f"All targets deleted successfully for client {client_id}",
                 "client_id": client_id
@@ -4490,17 +4549,20 @@ if __name__ == '__main__':
     
     # Check if running in Railway environment
     if os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('ENVIRONMENT') == 'production':
-        # Production environment - use waitress
-        from waitress import serve
-        serve(app, host='0.0.0.0', port=port, threads=8)
+        # Production environment - use socketio with gevent (if installed)
+        print(f"Starting production server with SocketIO on port {port}")
+        socketio.run(app, host='0.0.0.0', port=port)
     else:
         # Development environment
         try:
-            from waitress import serve
-            print(f"Starting development server with waitress on port {port}")
-            serve(app, host='0.0.0.0', port=port, threads=4)
-        except ImportError:
-            # Fallback to Flask development server if waitress is not installed
+            # Prefer socketio.run for development to support websockets
+            # Note: debug=True with gevent can sometimes cause issues with reloader
+            print(f"Starting development server with SocketIO on port {port}")
+            socketio.run(app, host='0.0.0.0', port=port, debug=True)
+        except Exception as e:
+            print(f"Error starting SocketIO server: {e}")
+            traceback.print_exc()
+            # Fallback to Flask development server if SocketIO fails (though it shouldn't if installed)
             print(f"Starting development server with Flask on port {port}")
             app.run(
                 host='0.0.0.0',
