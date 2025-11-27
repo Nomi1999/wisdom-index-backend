@@ -2,6 +2,19 @@
 import gevent.monkey
 gevent.monkey.patch_all()
 
+# Patch psycopg2 to be gevent-friendly
+# This is critical for performance when using gevent with PostgreSQL
+# Without this, database queries will block the entire event loop
+try:
+    from psycogreen.gevent import patch_psycopg
+    patch_psycopg()
+    print("Successfully patched psycopg2 for gevent")
+except ImportError:
+    print("WARNING: psycogreen not found. PostgreSQL queries will block the gevent loop!")
+    print("Install it with: pip install psycogreen")
+except Exception as e:
+    print(f"Error patching psycopg2: {e}")
+
 # NOTE: If using OpenAI with gevent, ensure openai >= 1.55.3 to avoid "Client.__init__() got an unexpected keyword argument 'proxies'"
 # This error happens because older openai versions + gevent interfere with httpx's proxy handling during thread patching.
 
