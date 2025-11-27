@@ -2892,19 +2892,89 @@ def get_admin_analytics():
         cursor.execute('SELECT COUNT(*) FROM core.users WHERE "isAdmin" = false')
         analytics['active_client_accounts'] = cursor.fetchone()[0]
         
-        # Income and expense aggregates
-        cursor.execute("""
-            SELECT
-                COALESCE(SUM(i.current_year_amount), 0) as total_income,
-                COALESCE(SUM(e.annual_amount), 0) as total_expenses
-            FROM core.clients c
-            LEFT JOIN core.incomes i ON c.client_id = i.client_id
-            LEFT JOIN core.expenses e ON c.client_id = e.client_id
-        """)
+# Income and expense aggregates
+        cursor.execute("SELECT COALESCE(SUM(current_year_amount), 0) FROM core.incomes")
+        income_result = cursor.fetchone()
+        analytics['total_income'] = income_result[0] if income_result else 0
         
-        income_expense = cursor.fetchone()
-        analytics['total_income'] = income_expense[0] if income_expense else 0
-        analytics['total_expenses'] = income_expense[1] if income_expense else 0
+        # Calculate total expenses using the same logic as individual clients
+        cursor.execute("""
+            WITH
+            -- Giving Expense
+            giving_expense AS (
+                SELECT
+                    COALESCE(SUM(annual_amount), 0) AS current_year_giving
+                FROM core.expenses
+                WHERE type = 'Spending'
+                    AND sub_type = 'GivingAndPhilanthropy'
+                    AND annual_amount > 0
+                    AND EXTRACT(YEAR FROM start_actual_date) <= EXTRACT(YEAR FROM CURRENT_DATE)
+                    AND (end_actual_date IS NULL OR EXTRACT(YEAR FROM end_actual_date) >= EXTRACT(YEAR FROM CURRENT_DATE))
+            ),
+
+            -- Savings Expense
+            savings_expense AS (
+                SELECT
+                    COALESCE(SUM(calculated_annual_amount_usd), 0) as current_year_savings
+                FROM core.savings
+                WHERE start_type = 'Active'
+            ),
+
+            -- Debt Expense
+            debt_expense AS (
+                WITH active_debts AS (
+                    SELECT
+                        client_id,
+                        CASE
+                          WHEN interest_rate IS NOT NULL AND loan_term_in_years IS NOT NULL THEN
+                            ABS(total_value) * (interest_rate / 12) /
+                            (1 - POWER(1 + (interest_rate / 12), -loan_term_in_years * 12)) * 12
+                          ELSE
+                            ABS(total_value) / 12
+                        END as annual_payment
+                    FROM core.liability_note_accounts
+                    WHERE total_value < 0
+                      AND repayment_type = 'PrincipalAndInterest'
+                      AND EXTRACT(YEAR FROM loan_date) <= EXTRACT(YEAR FROM CURRENT_DATE)
+                      AND (loan_term_in_years IS NULL OR
+                           EXTRACT(YEAR FROM loan_date) + loan_term_in_years >= EXTRACT(YEAR FROM CURRENT_DATE))
+                )
+                SELECT
+                    COALESCE(SUM(annual_payment), 0) as current_year_debt
+                FROM active_debts
+            ),
+
+            -- Tax Expense
+            tax_expense AS (
+                SELECT
+                    ROUND(COALESCE(SUM(current_year_amount), 0) * 0.15, 2) as current_year_taxes
+                FROM core.incomes
+                WHERE current_year_amount IS NOT NULL
+            ),
+
+            -- Living Expense
+            living_expense AS (
+                SELECT
+                    COALESCE(SUM(annual_amount), 0) AS current_year_living_expenses
+                FROM core.expenses
+                WHERE type = 'Living'
+                    AND annual_amount > 0
+                    AND EXTRACT(YEAR FROM start_actual_date) <= EXTRACT(YEAR FROM CURRENT_DATE)
+                    AND (end_actual_date IS NULL OR EXTRACT(YEAR FROM end_actual_date) >= EXTRACT(YEAR FROM CURRENT_DATE))
+                    AND (end_actual_date IS NULL OR end_actual_date >= start_actual_date)
+            )
+
+            -- Final Total Expense Calculation
+            SELECT
+                ROUND((COALESCE(g.current_year_giving, 0) +
+                 COALESCE(s.current_year_savings, 0) +
+                 COALESCE(d.current_year_debt, 0) +
+                 COALESCE(t.current_year_taxes, 0) +
+                 COALESCE(l.current_year_living_expenses, 0)),2) as total_expense
+            FROM giving_expense g, savings_expense s, debt_expense d, tax_expense t, living_expense l;
+        """)
+        expense_result = cursor.fetchone()
+        analytics['total_expenses'] = expense_result[0] if expense_result else 0
         analytics['total_margin'] = analytics['total_income'] - analytics['total_expenses']
         
         # Target completion rates
